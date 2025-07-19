@@ -2,7 +2,7 @@ using System.Collections.Concurrent;
 using CodeExecutionService.Host;
 using CodeExecutionService.Models;
 using CodeExecutionService.Services;
-using Microsoft.Extensions.DependencyInjection; // Убедитесь, что этот using присутствует
+
 
 var builder = WebApplication.CreateBuilder(args);
 
