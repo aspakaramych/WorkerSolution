@@ -1,5 +1,10 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
 using System.Text;
 using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
 using CodeExecutionService.Models;
 using Docker.DotNet;
 using Docker.DotNet.Models;
@@ -25,7 +30,6 @@ public class CodeExecutionWorker : BackgroundService
         _rabbitMqHost = _configuration["RabbitMQ:HostName"] ?? "localhost";
         _requestQueueName = _configuration["RabbitMQ:RequestQueue"] ?? "code_execution_requests";
         _resultQueueName = _configuration["RabbitMQ:ResultQueue"] ?? "code_execution_results";
-
 
         _dockerClient = new DockerClientConfiguration(
             new Uri("unix:///var/run/docker.sock"))
@@ -128,7 +132,7 @@ public class CodeExecutionWorker : BackgroundService
 
                     try
                     {
-                        _channel.BasicPublishAsync(exchange: "",
+                        await _channel.BasicPublishAsync(exchange: "",
                             routingKey: _resultQueueName,
                             body: responseBody);
                         await _channel.BasicAckAsync(ea.DeliveryTag, false);
@@ -178,7 +182,7 @@ public class CodeExecutionWorker : BackgroundService
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"Error checking queue status: {ex.Message}");
+            Console.Error.WriteLine($"Error: Failed to check queue status: {ex.Message}");
         }
     }
 
@@ -187,54 +191,34 @@ public class CodeExecutionWorker : BackgroundService
         string output = "";
         string error = "";
         string containerId = null;
-        string tempDir = null;
 
         try
         {
             string dockerImage = "";
-            List<string> cmdArgs = new List<string>(); 
-            string entrypoint = null; 
-            string containerWorkingDir = "/app"; 
+            string codeFileName = "";
+            string executionCommand = "";
+            string containerWorkingDir = "/app";
 
-   
             switch (language.ToLower())
             {
                 case "python":
                     dockerImage = "python:3.9-slim-buster";
-                    tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
-                    Directory.CreateDirectory(tempDir);
-                    string pythonFilePath = Path.Combine(tempDir, "script.py");
-                    await File.WriteAllTextAsync(pythonFilePath, code);
-                    
-                    entrypoint = "bash"; 
-                    cmdArgs.Add("-c"); 
-                    cmdArgs.Add($"ls -l {containerWorkingDir} && python {Path.Combine(containerWorkingDir, "script.py")}"); 
+                    codeFileName = "script.py";
+                    executionCommand = $"python {containerWorkingDir}/{codeFileName}";
                     break;
                 case "csharp":
                     dockerImage = "mcr.microsoft.com/dotnet/sdk:8.0";
-                    tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
-                    Directory.CreateDirectory(tempDir);
-                    string projectDir = Path.Combine(tempDir, "MyCSharpProject");
-                    Directory.CreateDirectory(projectDir);
-                    string programFilePath = Path.Combine(projectDir, "Program.cs");
-                    await File.WriteAllTextAsync(programFilePath, code);
-                    await File.WriteAllTextAsync(Path.Combine(projectDir, "MyCSharpProject.csproj"),
-                        "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net8.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable></PropertyGroup></Project>");
-                    
-                    entrypoint = "bash"; 
-                    containerWorkingDir = "/app/MyCSharpProject"; 
-                    cmdArgs.Add("-c");
-                    cmdArgs.Add("dotnet new console --force -o . && cp Program.cs . && dotnet build && dotnet run");
+                    codeFileName = "Program.cs";
+                    containerWorkingDir = "/app/MyCSharpProject";
+                    executionCommand = "dotnet new console --force -o . && " +
+                                       $"mv ../{codeFileName} ./{codeFileName} && " +
+                                       "dotnet build && " +
+                                       "dotnet run";
                     break;
                 case "javascript":
                     dockerImage = "node:18-slim";
-                    tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
-                    Directory.CreateDirectory(tempDir);
-                    string jsFilePath = Path.Combine(tempDir, "script.js");
-                    await File.WriteAllTextAsync(jsFilePath, code);
-                    
-                    entrypoint = "node"; // Entrypoint для Node.js
-                    cmdArgs.Add(Path.Combine(containerWorkingDir, "script.js")); 
+                    codeFileName = "script.js";
+                    executionCommand = $"node {containerWorkingDir}/{codeFileName}";
                     break;
                 default:
                     error = "Unsupported language.";
@@ -242,8 +226,9 @@ public class CodeExecutionWorker : BackgroundService
                     return new CodeExecutionResult { Output = output, Error = error };
             }
 
-     
+
             await EnsureDockerImageExists(dockerImage);
+
 
             var createContainerParameters = new CreateContainerParameters
             {
@@ -251,16 +236,13 @@ public class CodeExecutionWorker : BackgroundService
                 AttachStdout = true,
                 AttachStderr = true,
                 OpenStdin = false,
-                WorkingDir = containerWorkingDir,
+                WorkingDir = "/app", 
                 HostConfig = new HostConfig
                 {
                     NetworkMode = "none",
-                    Binds = tempDir != null ? new List<string> { $"{tempDir}:{containerWorkingDir}" } : null 
                 },
-                Entrypoint = entrypoint != null ? new List<string> { entrypoint } : null, 
-                Cmd = cmdArgs 
+                Cmd = new List<string> { "tail", "-f", "/dev/null" } 
             };
-
 
             var container = await _dockerClient.Containers.CreateContainerAsync(createContainerParameters);
             containerId = container.ID;
@@ -269,38 +251,71 @@ public class CodeExecutionWorker : BackgroundService
             await _dockerClient.Containers.StartContainerAsync(containerId, new ContainerStartParameters());
             Console.WriteLine($"Started Docker container: {containerId}");
 
-            var waitResult = await _dockerClient.Containers.WaitContainerAsync(containerId, CancellationToken.None);
-            Console.WriteLine($"Container {containerId} exited with status code: {waitResult.StatusCode}");
-
-            var logs = await _dockerClient.Containers.GetContainerLogsAsync(containerId, new ContainerLogsParameters
+            string writeCodeCommand;
+            if (language.ToLower() == "csharp")
             {
-                ShowStdout = true,
-                ShowStderr = true
-            });
-
-            using (var reader = new StreamReader(logs))
+                writeCodeCommand = $"mkdir -p {containerWorkingDir} && printf \"%s\" \"{code.Replace("\"", "\\\"").Replace("\n", "\\n").Replace("\r", "")}\" > {containerWorkingDir}/{codeFileName}";
+            }
+            else
             {
-                string line;
-                while ((line = await reader.ReadLineAsync()) != null)
-                {
-                    if (line.StartsWith("stdout:"))
-                    {
-                        output += line.Substring("stdout:".Length) + Environment.NewLine;
-                    }
-                    else if (line.StartsWith("stderr:"))
-                    {
-                        error += line.Substring("stderr:".Length) + Environment.NewLine;
-                    }
-                    else
-                    {
-                        output += line + Environment.NewLine;
-                    }
-                }
+                writeCodeCommand = $"printf \"%s\" \"{code.Replace("\"", "\\\"").Replace("\n", "\\n").Replace("\r", "")}\" > {containerWorkingDir}/{codeFileName}";
             }
 
-            if (waitResult.StatusCode != 0 && string.IsNullOrEmpty(error))
+            var execCreateResponseWrite = await _dockerClient.Exec.ExecCreateContainerAsync(
+                containerId,
+                new ContainerExecCreateParameters
+                {
+                    AttachStdout = true,
+                    AttachStderr = true,
+                    Cmd = new List<string> { "sh", "-c", writeCodeCommand },
+                    WorkingDir = "/app" 
+                },
+                CancellationToken.None); 
+
+            using (var streamWrite = await _dockerClient.Exec.StartAndAttachContainerExecAsync(
+                execCreateResponseWrite.ID,
+                false, 
+                CancellationToken.None))
             {
-                error = $"Code execution failed with exit code {waitResult.StatusCode}. Output: {output}";
+
+                (string stdOut, string stdErr) = await streamWrite.ReadOutputToEndAsync(CancellationToken.None);
+
+                var inspectExecWrite = await _dockerClient.Exec.InspectContainerExecAsync(execCreateResponseWrite.ID, CancellationToken.None);
+                if (inspectExecWrite.ExitCode != 0 || !string.IsNullOrEmpty(stdErr))
+                {
+                    Console.Error.WriteLine($"Error writing code to container (Exec ID: {execCreateResponseWrite.ID}): {stdErr} (Exit Code: {inspectExecWrite.ExitCode})");
+                    return new CodeExecutionResult { Output = "", Error = $"Failed to write code to container: {stdErr} (Exit Code: {inspectExecWrite.ExitCode})" };
+                }
+            }
+            Console.WriteLine($"Code written to {containerWorkingDir}/{codeFileName} in container {containerId}.");
+
+
+
+            var execCreateResponseExecute = await _dockerClient.Exec.ExecCreateContainerAsync(
+                containerId,
+                new ContainerExecCreateParameters
+                {
+                    AttachStdout = true,
+                    AttachStderr = true,
+                    Cmd = new List<string> { "sh", "-c", executionCommand },
+                    WorkingDir = containerWorkingDir 
+                },
+                CancellationToken.None); 
+
+            using (var streamExecute = await _dockerClient.Exec.StartAndAttachContainerExecAsync(
+                execCreateResponseExecute.ID,
+                false, 
+                CancellationToken.None))
+            {
+                (output, error) = await streamExecute.ReadOutputToEndAsync(CancellationToken.None);
+            }
+
+            var inspectExecResponse = await _dockerClient.Exec.InspectContainerExecAsync(execCreateResponseExecute.ID, CancellationToken.None);
+            long? statusCode = inspectExecResponse.ExitCode;
+
+            if (statusCode != 0 && string.IsNullOrEmpty(error))
+            {
+                error = $"Code execution failed with exit code {statusCode}. Output: {output}";
             }
         }
         catch (DockerApiException dockerEx)
@@ -327,24 +342,10 @@ public class CodeExecutionWorker : BackgroundService
                     Console.Error.WriteLine($"Error removing Docker container {containerId}: {ex.Message}");
                 }
             }
-
-            if (tempDir != null && Directory.Exists(tempDir))
-            {
-                try
-                {
-                    Directory.Delete(tempDir, true);
-                    Console.WriteLine($"Deleted temporary directory: {tempDir}");
-                }
-                catch (Exception ex)
-                {
-                    Console.Error.WriteLine($"Error deleting temporary directory {tempDir}: {ex.Message}");
-                }
-            }
         }
 
         return new CodeExecutionResult { Output = output, Error = error };
     }
-
 
     private async Task EnsureDockerImageExists(string imageName)
     {
