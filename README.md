@@ -9,4 +9,5 @@
 `docker pull python:3.9-slim-buster && docker pull  mcr.microsoft.com/dotnet/sdk:8.0 && docker pull node:18-slim && docker pull gcc:latest`
 
 2. Перейти в директорию проекта и выполнить:
+   
 `docker compose up --build`
