@@ -211,7 +211,6 @@ public class CodeExecutionWorker : BackgroundService
                     codeFileName = "Program.cs";
                     containerWorkingDir = "/app/MyCSharpProject";
                     executionCommand = "dotnet new console --force -o . && " +
-                                       $"mv ../{codeFileName} ./{codeFileName} && " +
                                        "dotnet build && " +
                                        "dotnet run";
                     break;
@@ -219,6 +218,12 @@ public class CodeExecutionWorker : BackgroundService
                     dockerImage = "node:18-slim";
                     codeFileName = "script.js";
                     executionCommand = $"node {containerWorkingDir}/{codeFileName}";
+                    break;
+                case "c++":
+                    dockerImage = "gcc:latest";
+                    codeFileName = "main.cpp";
+                    executionCommand = $"g++ -std=c++17 -o program {containerWorkingDir}/{codeFileName} &&" +
+                                       $"./{containerWorkingDir}/program";
                     break;
                 default:
                     error = "Unsupported language.";

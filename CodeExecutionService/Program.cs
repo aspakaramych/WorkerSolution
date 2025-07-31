@@ -13,6 +13,14 @@ builder.Services.AddEndpointsApiExplorer();
 
 builder.Services.AddSwaggerGen();
 
+builder.Services.AddCors(opt =>
+{
+    opt.AddDefaultPolicy(policy =>
+    {
+        policy.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod();
+    });
+});
+
 var pendingRequests = new ConcurrentDictionary<string, TaskCompletionSource<CodeExecutionResult>>();
 builder.Services.AddSingleton(pendingRequests);
 
@@ -33,6 +41,7 @@ var app = builder.Build();
 
 app.UseSwagger();
 app.UseSwaggerUI();
+app.UseCors();
 
 app.MapControllers();
 
